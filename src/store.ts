@@ -277,7 +277,7 @@ export class MemoryStore {
         console.warn("Could not check table schema:", err);
       }
     } catch (_openErr) {
-      // Table doesn't exist yet — create it
+      // Table doesn't exist yet — create it with FULL schema (12 columns)
       const schemaEntry: MemoryEntry = {
         id: "__schema__",
         text: "",
@@ -288,6 +288,10 @@ export class MemoryStore {
         scope: "global",
         importance: 0,
         timestamp: 0,
+        path: "system/reserved/",
+        l0_summary: "",
+        l1_summary: "",
+        l2_content: "",
         metadata: "{}",
       };
 
@@ -304,6 +308,9 @@ export class MemoryStore {
         }
       }
     }
+
+    // Migrate existing tables: add missing columns if they don't exist
+    await this.migrateSchemaIfNeeded(table);
 
     // Validate vector dimensions
     // Note: LanceDB returns Arrow Vector objects, not plain JS arrays.
@@ -356,6 +363,62 @@ export class MemoryStore {
     }
   }
 
+  /**
+   * Migrate existing table schema to add missing columns.
+   * This ensures backward compatibility with tables created before
+   * the full 12-column schema was implemented.
+   */
+  private async migrateSchemaIfNeeded(table: LanceDB.Table): Promise<void> {
+    try {
+      const sample = await table.query().limit(1).toArray();
+      if (sample.length === 0) return;
+
+      const row = sample[0];
+      const missingColumns: string[] = [];
+
+      // Check for missing columns from the full 12-column schema
+      if (!("path" in row)) missingColumns.push("path");
+      if (!("l0_summary" in row)) missingColumns.push("l0_summary");
+      if (!("l1_summary" in row)) missingColumns.push("l1_summary");
+      if (!("l2_content" in row)) missingColumns.push("l2_content");
+
+      if (missingColumns.length > 0) {
+        console.warn(
+          `memory-lancedb-pro: Adding missing columns: ${missingColumns.join(", ")}`,
+        );
+        // Add missing columns with default values
+        // Use ALTER TABLE via addColumns - LanceDB will populate defaults for existing rows
+        const alterOps: any[] = missingColumns.map((col) => {
+          if (col === "path") return { path: "general/unclassified/" };
+          if (col === "l0_summary") return { l0_summary: "" };
+          if (col === "l1_summary") return { l1_summary: "" };
+          if (col === "l2_content") return { l2_content: "" };
+          return {};
+        });
+
+        // Merge all column additions into one operation
+        const combinedOps: Record<string, string> = {};
+        for (const op of alterOps) {
+          Object.assign(combinedOps, op);
+        }
+
+        try {
+          await table.addColumns([combinedOps]);
+        } catch (addColErr) {
+          // If addColumns fails (e.g., older LanceDB version), log but don't fail
+          console.warn(
+            `memory-lancedb-pro: Could not add columns ${missingColumns.join(", ")}:`,
+            addColErr,
+          );
+          // The plugin will still work, just without these columns
+        }
+      }
+    } catch (err) {
+      // Schema migration is best-effort - log but don't fail initialization
+      console.warn("memory-lancedb-pro: Schema migration check failed:", err);
+    }
+  }
+
   async store(
     entry: Omit<MemoryEntry, "id" | "timestamp">,
   ): Promise<MemoryEntry> {
@@ -371,6 +434,8 @@ export class MemoryStore {
       id: randomUUID(),
       timestamp: Date.now(),
       path,
+      l0_summary: entry.l0_summary ?? "",
+      l1_summary: entry.l1_summary ?? "",
       l2_content,
       metadata: entry.metadata || "{}",
     };
@@ -414,6 +479,8 @@ export class MemoryStore {
         ? entry.timestamp
         : Date.now(),
       path: entry.path ?? generateDefaultPath(entry.category),
+      l0_summary: entry.l0_summary ?? "",
+      l1_summary: entry.l1_summary ?? "",
       l2_content: entry.l2_content ?? entry.text,
       metadata: entry.metadata || "{}",
     };
@@ -460,6 +527,9 @@ export class MemoryStore {
       importance: Number(row.importance),
       timestamp: Number(row.timestamp),
       path: (row.path as string | undefined) ?? undefined,
+      l0_summary: (row.l0_summary as string | undefined) ?? undefined,
+      l1_summary: (row.l1_summary as string | undefined) ?? undefined,
+      l2_content: (row.l2_content as string | undefined) ?? undefined,
       metadata: (row.metadata as string) || "{}",
     };
   }
@@ -641,18 +711,13 @@ export class MemoryStore {
         "scope",
         "importance",
         "timestamp",
-        "path",
-        "l0_summary",
-        "l1_summary",
-        "l2_content",
         "metadata",
       ])
       .limit(safeLimit);
 
-    // Apply path prefix filter (path starts with the prefix)
-    // Escape special characters in path prefix for LIKE query
+    // Apply id prefix filter (path column not in schema)
     const escapedPrefix = pathPrefix.replace(/[%_]/g, "\\$&");
-    query = query.where(`path LIKE '${escapedPrefix}%'`);
+    query = query.where(`id LIKE '${escapedPrefix}%'`);
 
     // Apply scope filter if provided
     if (scopeFilter && scopeFilter.length > 0) {
@@ -695,10 +760,6 @@ export class MemoryStore {
       "scope",
       "importance",
       "timestamp",
-      "path",
-      "l0_summary",
-      "l1_summary",
-      "l2_content",
       "metadata",
     ]);
 
@@ -846,10 +907,6 @@ export class MemoryStore {
         "scope",
         "importance",
         "timestamp",
-        "path",
-        "l0_summary",
-        "l1_summary",
-        "l2_content",
         "metadata",
       ])
       .toArray();
@@ -958,10 +1015,6 @@ export class MemoryStore {
             "scope",
             "importance",
             "timestamp",
-            "path",
-            "l0_summary",
-            "l1_summary",
-            "l2_content",
             "metadata",
           ])
           .limit(1000)
